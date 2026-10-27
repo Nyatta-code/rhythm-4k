@@ -1,0 +1,119 @@
+name: Build JAR
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # CLDC wants class file version 47, only JDK 8 can still produce it
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: Fetch CLDC/MIDP API stubs and ProGuard
+        run: |
+          mkdir -p libs build/stubs build/classes dist res stubsrc/javax/microedition/media
+          M=https://repo1.maven.org/maven2
+          curl -fsSL -o libs/cldcapi11.jar $M/org/microemu/cldcapi11/2.0.3/cldcapi11-2.0.3.jar
+          curl -fsSL -o libs/midpapi20.jar $M/org/microemu/midpapi20/2.0.3/midpapi20-2.0.3.jar
+          curl -fsSL -o libs/proguard.jar $M/net/sf/proguard/proguard-base/6.0.3/proguard-base-6.0.3.jar
+
+      # Compile-time only stubs for the media API (the phone has the real one)
+      - name: Create media API stubs
+        run: |
+          cat > stubsrc/javax/microedition/media/MediaException.java <<'EOF'
+          package javax.microedition.media;
+          public class MediaException extends Exception {
+              public MediaException() {}
+              public MediaException(String m) { super(m); }
+          }
+          EOF
+          cat > stubsrc/javax/microedition/media/Player.java <<'EOF'
+          package javax.microedition.media;
+          public interface Player {
+              void realize() throws MediaException;
+              void prefetch() throws MediaException;
+              void start() throws MediaException;
+              void stop() throws MediaException;
+              void close();
+          }
+          EOF
+          cat > stubsrc/javax/microedition/media/Manager.java <<'EOF'
+          package javax.microedition.media;
+          import java.io.IOException;
+          import java.io.InputStream;
+          public final class Manager {
+              private Manager() {}
+              public static Player createPlayer(InputStream stream, String type)
+                      throws IOException, MediaException {
+                  return null;
+              }
+          }
+          EOF
+          javac -source 1.3 -target 1.3 \
+            -bootclasspath libs/cldcapi11.jar:libs/midpapi20.jar \
+            -d build/stubs stubsrc/javax/microedition/media/*.java
+
+      - name: Compile
+        run: |
+          javac -source 1.3 -target 1.3 \
+            -bootclasspath libs/cldcapi11.jar:libs/midpapi20.jar:build/stubs \
+            -d build/classes src/*.java
+
+      - name: Package and preverify
+        run: |
+          cat > MANIFEST.MF <<'EOF'
+          Manifest-Version: 1.0
+          MIDlet-1: Rhythm 4K,,RhythmGame
+          MIDlet-Name: Rhythm 4K
+          MIDlet-Vendor: Me
+          MIDlet-Version: 1.0.0
+          MicroEdition-Configuration: CLDC-1.1
+          MicroEdition-Profile: MIDP-2.0
+          EOF
+          # res/ may hold chart.txt and song.mp3 (optional)
+          jar cfm build/game.jar MANIFEST.MF -C build/classes . -C res .
+          cat > proguard.pro <<'EOF'
+          -injars build/game.jar
+          -outjars dist/RhythmGame.jar
+          -libraryjars libs/cldcapi11.jar
+          -libraryjars libs/midpapi20.jar
+          -libraryjars build/stubs
+          -microedition
+          -dontobfuscate
+          -dontoptimize
+          -keep public class * extends javax.microedition.midlet.MIDlet
+          EOF
+          java -cp libs/proguard.jar proguard.ProGuard @proguard.pro
+          # make sure the manifest survived ProGuard
+          jar umf MANIFEST.MF dist/RhythmGame.jar
+          SIZE=$(stat -c%s dist/RhythmGame.jar)
+          grep -v '^Manifest-Version' MANIFEST.MF > dist/RhythmGame.jad
+          echo "MIDlet-Jar-URL: RhythmGame.jar" >> dist/RhythmGame.jad
+          echo "MIDlet-Jar-Size: $SIZE" >> dist/RhythmGame.jad
+          unzip -l dist/RhythmGame.jar
+          unzip -p dist/RhythmGame.jar META-INF/MANIFEST.MF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RhythmGame
+          path: dist/
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Rhythm 4K build ${{ github.run_number }}
+          files: |
+            dist/RhythmGame.jar
+            dist/RhythmGame.jad
